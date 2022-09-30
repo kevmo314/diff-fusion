@@ -29,6 +29,36 @@ DEBUG = False
 to_pil_image = torchvision.transforms.ToPILImage(mode='RGB')
 pil_to_tensor = torchvision.transforms.PILToTensor()
 
+trans_t = lambda t : np.array([
+    [1,0,0,0],
+    [0,1,0,0],
+    [0,0,1,t],
+    [0,0,0,1],
+])
+
+rot_phi = lambda phi : np.array([
+    [1,0,0,0],
+    [0,np.cos(phi),-np.sin(phi),0],
+    [0,np.sin(phi), np.cos(phi),0],
+    [0,0,0,1],
+])
+
+rot_theta = lambda th : np.array([
+    [np.cos(th),0,-np.sin(th),0],
+    [0,1,0,0],
+    [np.sin(th),0, np.cos(th),0],
+    [0,0,0,1],
+])
+
+
+def pose_spherical(theta, phi, radius):
+    c2w = trans_t(radius)
+    c2w = rot_phi(phi/180.*np.pi) @ c2w
+    c2w = rot_theta(theta/180.*np.pi) @ c2w
+    c2w = np.array([[-1,0,0,0],[0,0,1,0],[0,1,0,0],[0,0,0,1]]) @ c2w
+    return c2w
+
+
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
     """
@@ -500,7 +530,7 @@ def config_parser():
                         help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
 
     ## stablediffusion flags
-    parser.add_argument("--prompt", type=str, default='a photo of an astronaut riding a horse on mars',
+    parser.add_argument("--prompt", type=str, default='a wide angle photo of a single red lego sedan against a white background',
                         help='prompt for stablediffusion dataset')
 
     ## deepvoxels flags
@@ -530,34 +560,21 @@ def config_parser():
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=500, 
                         help='frequency of tensorboard image logging')
-    parser.add_argument("--i_weights", type=int, default=10000, 
+    parser.add_argument("--i_weights", type=int, default=1000000000, 
                         help='frequency of weight ckpt saving')
-    parser.add_argument("--i_testset", type=int, default=50000, 
+    parser.add_argument("--i_testset", type=int, default=5000000000, 
                         help='frequency of testset saving')
     parser.add_argument("--i_video",   type=int, default=50000, 
                         help='frequency of render_poses video saving')
 
     return parser
 
-def random_pose():
-    # generate a random 3d rotation matrix
-    R = np.random.rand(3, 3) * 2 - 1
-    # compute the point projected one unit away from the origin
-    # in the direction of the camera
-    x = R @ np.array([-1, 0, 0])
-    M = np.eye(4)
-    M[:3, :3] = R
-    M[:3, 3] = x
-    return M
 
-def random_offset_pose(R0):
-    dR = np.random.rand(3, 3) * 5e-3
-    R = R0[:3, :3].cpu().numpy() # + dR
-    x = R @ np.array([-1, 0, 0])
-    M = np.eye(4)
-    M[:3, :3] = R
-    M[:3, 3] = x
-    return M
+def random_pose():
+    th = np.random.rand() * 360
+    phi = np.random.rand() * 180 - 90
+    c2w = pose_spherical(th, phi, 4.)
+    return c2w
 
 
 def train():
@@ -608,6 +625,11 @@ def train():
         else:
             images = images[...,:3]
 
+        render_poses = []
+        for th in tqdm(np.linspace(0., 360., 120, endpoint=False)):
+            c2w = pose_spherical(th, -30., 4.)
+            render_poses.append(c2w)
+
     elif args.dataset_type == 'LINEMOD':
         images, poses, render_poses, hwf, K, i_split, near, far = load_LINEMOD_data(args.datadir, args.half_res, args.testskip)
         print(f'Loaded LINEMOD, images shape: {images.shape}, hwf: {hwf}, K: {K}')
@@ -635,36 +657,35 @@ def train():
     elif args.dataset_type == 'stablediffusion':
         print("running with stable diffusion")
         # stable_diffusion.safety_checker = lambda images, clip_input: (images, False)
-        near, far = 0.0, 1.0  # wherever you are
-        hwf = [64, 64, 555]
+        near, far = 2., 6.  # wherever you are
+        hwf = [512, 512, 555]
         pipe = StableDiffusionPipeline.from_pretrained(
             "CompVis/stable-diffusion-v1-4",
-            revision="fp16",
-            torch_dtype=torch.float16,
             use_auth_token=True
         )
         pipe = pipe.to("cuda")
-        pipe.enable_attention_slicing()
 
         with autocast("cuda"):
-            image = pipe(args.prompt)
+            image = pipe(args.prompt, guidance_scale=35)
             image.images[0].save("debug/initial.png")
-            image = pil_to_tensor(image.images[0].resize((64, 64)))
+            image = pil_to_tensor(image.images[0].resize((512, 512))).permute(1, 2, 0)
         images = image.unsqueeze(0) / 255.0
 
-        render_poses = [random_pose()]
-        poses = [random_pose()]
+        render_poses = []
+        for th in tqdm(np.linspace(0., 360., 120, endpoint=False)):
+            c2w = pose_spherical(th, -30., 4.)
+            render_poses.append(c2w)
+
+        poses = [pose_spherical(0, -30., 4.)]
         i_train, i_val, i_test = list(range(len(poses))), list(range(len(poses))), list(range(len(poses)))
         args.no_batching = True
+        args.lrate_decay *= 100
 
         pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
             "CompVis/stable-diffusion-v1-4",
-            revision="fp16",
-            torch_dtype=torch.float16,
             use_auth_token=True
         )
         pipe = pipe.to("cuda")
-        pipe.enable_attention_slicing()
 
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -761,7 +782,7 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 200000 + 1
+    N_iters = 2000000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -769,35 +790,54 @@ def train():
 
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-    
+    theta, phi = 0, 0
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
 
-        if args.dataset_type == 'stablediffusion' and i % 300 == 0:
-            # update a new viewport
-            poses = [random_offset_pose(p) for p in poses]
-            poses = torch.Tensor(poses).to(device)
-
+        if args.dataset_type == 'stablediffusion' and i % 500 == 0:
             img_i = np.random.choice(i_train)
             target = images[img_i]
             pose = poses[img_i, :3,:4]
-            rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
-            batch_rays = torch.stack([rays_o, rays_d], 0)
-            rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
-                                                    verbose=i < 10, retraw=True,
-                                                    **render_kwargs_train)
+            with torch.no_grad():
+                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+                batch_rays = torch.stack([rays_o, rays_d], 0)
+                rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                        verbose=i < 10, retraw=True,
+                                                        **render_kwargs_train)
 
-            print(rgb.shape)
-            rgbimg = to_pil_image(rgb.permute(2, 0, 1))
-            rgbimg.save('debug/nerf-output-%d.png' % i)
-            
+            rgbimg = to_pil_image(rgb.permute(2, 0, 1)).resize((512, 512))
+            rgbimg.save('debug/nerf-input.png')
+
+            # update a new viewport
+            theta += np.random.rand() * 20
+            phi += np.random.rand() * 5
+            new_pose = pose_spherical(theta, phi, 4.)
+            new_pose = torch.Tensor(new_pose).to(device)
+
+            img_i = np.random.choice(i_train)
+            target = images[img_i]
+            with torch.no_grad():
+                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(new_pose[:3, :4]))  # (H, W, 3), (H, W, 3)
+                batch_rays = torch.stack([rays_o, rays_d], 0)
+                rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
+                                                        verbose=i < 10, retraw=True,
+                                                        **render_kwargs_train)
+
+            rgbimg = to_pil_image(rgb.permute(2, 0, 1)).resize((512, 512))
+            rgbimg.save('debug/nerf-output.png')
+
             # run through stable diffusion
             with autocast("cuda"):
-                image = pipe(args.prompt, init_image=rgbimg, strength=0.25, guidance_scale=4)
-                image.images[0].save('debug/sd-output-%d.png' % i)
-                image = pil_to_tensor(image.images[0])
-            images = image.permute(1, 2, 0).unsqueeze(0) / 255.0
+                image = pipe(args.prompt, init_image=rgbimg, strength=0.5, guidance_scale=35)
+                image.images[0].save('debug/sd-output.png')
+                image = pil_to_tensor(image.images[0].resize((H, W))).permute(1, 2, 0)
+            images = torch.cat((images, image.unsqueeze(0) / 255.0))
+            poses = torch.cat((poses, new_pose.unsqueeze(0)))
+            if len(images) > 10:
+                images = images[1:]
+                poses = poses[1:]
+            i_train = list(range(len(images)))
 
         # Sample random ray batch
         if use_batching:
@@ -817,13 +857,10 @@ def train():
             # Random from one image
             img_i = np.random.choice(i_train)
             target = images[img_i]
+            target = torch.Tensor(target).to(device)
             pose = poses[img_i, :3,:4]
 
-            if args.dataset_type == 'stablediffusion':
-                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
-                batch_rays = torch.stack([rays_o, rays_d], 0)
-
-            elif N_rand is not None:
+            if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
 
                 if i < args.precrop_iters:
@@ -852,11 +889,7 @@ def train():
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
         optimizer.zero_grad()
-        rgbimg = to_pil_image(target)
-        rgbimg.save('debug/nerf-target.png')
-        rgbimg = to_pil_image(rgb.permute(2, 0, 1))
-        rgbimg.save('debug/nerf-est.png')
-        img_loss = img2mse(rgb, target.permute(1, 2, 0))
+        img_loss = img2mse(rgb, target_s)
         trans = extras['raw'][...,-1]
         loss = img_loss
         psnr = mse2psnr(img_loss)

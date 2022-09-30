@@ -14,33 +14,17 @@ def noise(image):
     return image + torch.from_numpy(gauss).half().to("cuda")
 
 def main():
-    pipe = StableDiffusionPipeline.from_pretrained(
-        "CompVis/stable-diffusion-v1-4",
-        revision="fp16",
-        torch_dtype=torch.float16,
-        use_auth_token=True
-    )
-    pipe = pipe.to("cuda")
-
-    prompt = "a zoomed out DSLR photo of a table with dim sum on it"
-    with autocast("cuda"):
-        image = pipe(prompt)
-        image = image.images[0]
-        image.save(f"image_0.png")
-
+    image = Image.open('debug/nerf-output-500.png').convert('RGB').resize((512, 512))
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
         "CompVis/stable-diffusion-v1-4",
-        revision="fp16",
-        torch_dtype=torch.float16,
         use_auth_token=True
     )
     pipe = pipe.to("cuda")
 
     with autocast("cuda"):
-        for i in range(100):
-            image = pipe(prompt, init_image=image, strength=0.25, guidance_scale=4)
-            image = image.images[0]
-            image.save(f"image_{i + 1}.png")
+        image = pipe("a DSLR photo of a tiger eating a bowl of cereal", init_image=image, strength=0.9, guidance_scale=10)
+        image = image.images[0]
+        image.save(f"image_0.png")
 
 if __name__ == "__main__":
     main()
